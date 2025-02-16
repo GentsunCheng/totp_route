@@ -1,0 +1,9 @@
+interval = 30
+extend = 15
+base_port = 3000
+port_range = 1000
+secret = ''
+offsets = [-15, 0, 15]
+host = '127.0.0.1' # target host or server ip
+port = 8080 # server port or client listen port
+mode = 'client' # server or client
