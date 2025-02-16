@@ -61,16 +61,20 @@ if __name__ == '__main__':
     port       = config.get('port', 8080)
     mode       = config.get('mode', 'server').lower()
 
+    protocol   = config.get('protocol', 'tcp').lower()
+
     if mode == 'server':
         # 在服务端模式下，host 与 port 分别为目标转发地址与目标转发端口
         from modules.route.route import Server
         app = Server(interval=interval, extend=extend, base_port=base_port, port_range=port_range,
-                        secret=secret, offsets=offsets, target_host=host, target_port=port)
+                        secret=secret, offsets=offsets, target_host=host, target_port=port,
+                        protocol=protocol)
     elif mode == 'client':
         # 在客户端模式下，host 为服务端 IP，port 为本地监听端口
         from modules.route.route import Client
         app = Client(interval=interval, extend=extend, base_port=base_port, port_range=port_range,
-                        secret=secret, offsets=offsets, server_ip=host, local_listen_port=port)
+                        secret=secret, offsets=offsets, server_ip=host, local_listen_port=port,
+                        protocol=protocol)
     else:
         print("无效的 mode 配置，请设置为 'server' 或 'client'")
         sys.exit(1)
