@@ -8,38 +8,62 @@ import threading
 import pyotp
 import toml
 import sys
+import concurrent.futures
 
-def bidirectional_forward_tcp(conn1, conn2):
+# 全局线程池，复用线程，最大工作线程数可以根据需要调整
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=200)
+
+def set_tcp_options(sock):
     """
-    TCP 双向转发：启动两个线程分别转发 conn1->conn2 与 conn2->conn1，
-    直到任一端断开连接。
+    设置TCP优化参数：禁用Nagle算法，调整收发缓冲区大小
     """
-    def forward(src, dst):
-        try:
-            while True:
-                data = src.recv(4096)
-                if not data:
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)  # 64KB
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)  # 64KB
+    except Exception:
+        pass
+
+def optimized_bidirectional_forward_tcp(conn1, conn2):
+    """
+    优化后的TCP双向转发：
+      - 在连接上设置TCP选项
+      - 使用预分配内存和 recv_into 避免频繁分配内存
+      - 利用全局线程池复用线程
+    """
+    # 为两个连接设置TCP选项
+    set_tcp_options(conn1)
+    set_tcp_options(conn2)
+    
+    BUFSIZE = 8192
+    buf1 = bytearray(BUFSIZE)
+    buf2 = bytearray(BUFSIZE)
+
+    def forward(src, dst, buf):
+        while True:
+            try:
+                n = src.recv_into(buf)
+                if n == 0:
                     break
-                dst.sendall(data)
+                dst.sendall(buf[:n])
+            except Exception:
+                break
+        try:
+            dst.shutdown(socket.SHUT_WR)
         except Exception:
             pass
-        finally:
-            try:
-                dst.shutdown(socket.SHUT_WR)
-            except Exception:
-                pass
 
-    t1 = threading.Thread(target=forward, args=(conn1, conn2))
-    t2 = threading.Thread(target=forward, args=(conn2, conn1))
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
+    future1 = executor.submit(forward, conn1, conn2, buf1)
+    future2 = executor.submit(forward, conn2, conn1, buf2)
+    concurrent.futures.wait([future1, future2])
 
+###############################################################################
+# Server 类（TCP/UDP均支持，这里TCP部分做了优化）
+###############################################################################
 class Server:
     """
     服务端中间件类：
-      - 根据 TOTP 算法动态监听端口（使用 protocol）
+      - 根据 TOTP 算法动态监听端口（统一使用 protocol）
       - 当有客户端接入时，通过 protocol 将数据转发至目标地址（目标程序）
     """
     def __init__(self, interval, extend, base_port, port_range, secret, offsets,
@@ -79,7 +103,7 @@ class Server:
         return port, valid_start, valid_end
 
     def create_tcp_socket(self, port):
-        """创建 TCP 监听 socket（非阻塞）"""
+        """创建TCP监听socket（非阻塞）"""
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setblocking(False)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -88,7 +112,7 @@ class Server:
         return s
 
     def create_udp_socket(self, port):
-        """创建 UDP socket（非阻塞）"""
+        """创建UDP socket（非阻塞）"""
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setblocking(False)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -97,26 +121,27 @@ class Server:
 
     def handle_tcp_connection(self, client_conn, offset, listening_port):
         """
-        TCP 处理函数：客户端通过 TOTP 动态端口连接后，
-        建立到目标地址的 TCP 连接，并启动双向转发。
+        TCP处理函数：客户端通过TOTP动态端口连接后，
+        建立到目标地址的TCP连接，并启动双向转发（使用优化后的转发函数）
         """
         print(f"[{time.strftime('%H:%M:%S')}] 收到 {client_conn.getpeername()} 的连接（偏移 {offset}，端口 {listening_port}）")
         try:
             target_conn = socket.create_connection((self.target_host, self.target_port))
+            set_tcp_options(target_conn)
         except Exception as e:
             print(f"连接目标 {self.target_host}:{self.target_port} 失败: {e}")
             client_conn.close()
             return
 
-        bidirectional_forward_tcp(client_conn, target_conn)
+        optimized_bidirectional_forward_tcp(client_conn, target_conn)
         client_conn.close()
         target_conn.close()
         print(f"[{time.strftime('%H:%M:%S')}] 连接关闭，转发结束。")
 
     def handle_udp_packet(self, sock, data, client_addr, offset, listening_port):
         """
-        UDP 处理函数：收到 UDP 数据包后，
-        通过 UDP 将数据发送到目标地址，再将目标响应转发回客户端。
+        UDP处理函数：收到UDP数据包后，
+        通过UDP将数据发送到目标地址，再将目标响应转发回客户端。
         """
         print(f"[{time.strftime('%H:%M:%S')}] 收到来自 {client_addr} 的 UDP 数据包（偏移 {offset}，端口 {listening_port}）")
         try:
@@ -182,7 +207,8 @@ class Server:
                 try:
                     client_conn, addr = s.accept()
                     client_conn.setblocking(True)
-                    threading.Thread(target=self.handle_tcp_connection, args=(client_conn, offset, s.getsockname()[1])).start()
+                    # 提交到线程池处理TCP转发
+                    executor.submit(self.handle_tcp_connection, client_conn, offset, s.getsockname()[1])
                 except Exception as e:
                     print("接受连接时出错:", e)
 
@@ -234,6 +260,9 @@ class Server:
                 except Exception as e:
                     print("处理 UDP 数据包时出错:", e)
 
+###############################################################################
+# Client 类（TCP/UDP均支持，TCP部分使用优化后的转发）
+###############################################################################
 class Client:
     """
     客户端中间件类：
@@ -264,9 +293,9 @@ class Client:
 
     def handle_tcp_connection(self, local_conn):
         """
-        TCP 处理函数：本地应用连接后，
-        客户端尝试通过 protocol 连接服务器的 TOTP 动态端口，
-        并进行双向转发。
+        TCP处理函数：本地应用连接后，
+        客户端尝试通过 protocol 连接服务器的TOTP动态端口，并进行双向转发
+        （使用优化后的转发函数）
         """
         print(f"[{time.strftime('%H:%M:%S')}] 本地连接来自 {local_conn.getpeername()}")
         server_conn = None
@@ -276,6 +305,7 @@ class Client:
                 port = self.get_totp_port(target_time)
                 print(f"[{time.strftime('%H:%M:%S')}] 尝试连接服务器 {self.server_ip}:{port}（偏移 {offset}）")
                 server_conn = socket.create_connection((self.server_ip, port), timeout=5)
+                set_tcp_options(server_conn)
                 print(f"[{time.strftime('%H:%M:%S')}] 连接成功：{self.server_ip}:{port}")
                 break
             except Exception as e:
@@ -284,16 +314,16 @@ class Client:
             print("无法连接到服务器的 TOTP 端口")
             local_conn.close()
             return
-        bidirectional_forward_tcp(local_conn, server_conn)
+        optimized_bidirectional_forward_tcp(local_conn, server_conn)
         local_conn.close()
         server_conn.close()
         print(f"[{time.strftime('%H:%M:%S')}] 本地连接关闭，转发结束。")
 
     def handle_udp_packet(self, local_sock, data, client_addr):
         """
-        UDP 处理函数：收到本地 UDP 数据包后，
-        客户端尝试通过 protocol 向服务器发送数据，
-        并将服务器响应转发回本地。
+        UDP处理函数：收到本地UDP数据包后，
+        客户端尝试通过 protocol 向服务器发送数据，并将服务器响应转发回本地
+        （此处未做长连接优化，UDP转发原理与TCP不同）
         """
         print(f"[{time.strftime('%H:%M:%S')}] 本地 UDP 数据包来自 {client_addr}")
         for offset in self.offsets:
@@ -301,15 +331,15 @@ class Client:
                 target_time = time.time() + offset
                 port = self.get_totp_port(target_time)
                 print(f"[{time.strftime('%H:%M:%S')}] 尝试通过 UDP 连接服务器 {self.server_ip}:{port}（偏移 {offset}）")
-                server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                server_sock.settimeout(5)
-                server_sock.sendto(data, (self.server_ip, port))
-                response, _ = server_sock.recvfrom(4096)
+                udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                udp_sock.settimeout(5)
+                udp_sock.sendto(data, (self.server_ip, port))
+                response, _ = udp_sock.recvfrom(4096)
                 local_sock.sendto(response, client_addr)
                 print(f"[{time.strftime('%H:%M:%S')}] UDP 转发成功，使用偏移 {offset}")
                 return
             except Exception as e:
-                print(f"连接服务器 {self.server_ip}:{port} 失败: {e}")
+                print(f"使用偏移 {offset} 连接服务器 {self.server_ip}:{port} 失败: {e}")
         print("无法通过 UDP 连接到服务器的 TOTP 端口")
 
     def run(self):
@@ -332,7 +362,7 @@ class Client:
             try:
                 local_conn, addr = listener.accept()
                 local_conn.setblocking(True)
-                threading.Thread(target=self.handle_tcp_connection, args=(local_conn,)).start()
+                executor.submit(self.handle_tcp_connection, local_conn)
             except Exception as e:
                 print("接受本地连接失败:", e)
 
@@ -358,6 +388,9 @@ class Client:
                 except Exception as e:
                     print("接收本地 UDP 数据失败:", e)
 
+###############################################################################
+# 配置加载与主程序
+###############################################################################
 def load_config(config_file):
     """
     从 toml 文件加载配置参数  
@@ -381,7 +414,7 @@ def load_config(config_file):
         sys.exit(1)
 
 if __name__ == '__main__':
-    # 默认配置文件为 config.toml，也可通过命令行参数指定
+    # 默认配置文件为 config.toml，也可通过命令行参数指定其他文件
     config_file = 'config.toml'
     if len(sys.argv) > 1:
         config_file = sys.argv[1]
@@ -396,7 +429,6 @@ if __name__ == '__main__':
     host       = config.get('host', '127.0.0.1')
     port       = config.get('port', 8080)
     mode       = config.get('mode', 'server').lower()
-
     protocol   = config.get('protocol', 'tcp').lower()
 
     if mode == 'server':
