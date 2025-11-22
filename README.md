@@ -1,3 +1,5 @@
+# 以迁移至[OkaRoute](https://github.com/GentsunCheng/OkaRoute)
+
 # TOTP Route
 
 基于TOTP（Time-based One-Time Password）的随机端口流量转发工具
